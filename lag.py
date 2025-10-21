@@ -407,7 +407,7 @@ DAMAGE_BURST_SIZE = 50     # MEJORADO - Mantiene bursts pero controlados
 FREEZE_BURST_SIZE = 100    # MEJORADO - Mantiene bursts pero controlados
 # CONFIGURACIÓN MÁXIMA POTENCIA TELEPORT Y GHOST
 MAX_TELE_PACKETS = 800     # POTENTE - Máximo de paquetes teleport
-MAX_GHOST_PACKETS = 600    # POTENTE - Máximo de paquetes ghost
+MAX_GHOST_POSITION_BUFFER = 5  # CRÍTICO - Solo mantener últimos 5 paquetes de posición
 TELE_BURST_SIZE = 75       # POTENTE - Burst masivo de teleport
 GHOST_BURST_SIZE = 60      # POTENTE - Burst masivo de ghost
 lock = threading.Lock()  # Lock para sincronização de threads
@@ -965,12 +965,11 @@ class MainWindow(QMainWindow):
         if app_state == AppState.WAITING_FOR_HOTKEY:
             return
         if ghost_mode:
-            # DESACTIVAR: Enviar SOLO posición actual (últimos paquetes) + todo el daño acumulado
+            # DESACTIVAR: Enviar SOLO últimos paquetes del buffer + todo el daño acumulado
             with lock:
                 ghost_mode = False
-                # SOLO tomar los ÚLTIMOS 20 paquetes de posición (posición actual/reciente)
-                # Esto evita enviar toda la ruta, solo la posición final
-                recent_position_packets = list(packet_ghost[-20:]) if len(packet_ghost) > 0 else []
+                # El buffer ya contiene SOLO los últimos MAX_GHOST_POSITION_BUFFER paquetes
+                current_position_packets = list(packet_ghost)  # Ya son solo 5 paquetes
                 damage_pkts = list(ghost_damage_packets)  # TODO el daño acumulado
                 packet_ghost.clear()
                 ghost_damage_packets.clear()
@@ -978,14 +977,14 @@ class MainWindow(QMainWindow):
             self.signals.update_button_state.emit(False, "Ghost")
             self.audio_manager.play_toggle_off()
             def send_ghost_position_and_damage(pos_packets, dmg_packets):
-                """Envía SOLO posición ACTUAL + todo el daño acumulado instantáneamente"""
+                """Envía buffer de posición (solo últimos 5) + todo el daño acumulado"""
                 try:
                     sent_count = 0
                     damage_count = 0
                     bytes_sent = 0
                     with pydivert.WinDivert(FILTER_GHOST, layer=pydivert.Layer.NETWORK) as sender:
-                        # FASE 1: Enviar SOLO últimos paquetes de posición (POSICIÓN ACTUAL)
-                        # Sin burst, enviamos todos los paquetes recientes de golpe
+                        # FASE 1: Enviar buffer de posición (máximo 5 paquetes)
+                        # Estos son los ÚNICOS paquetes de posición que tenemos
                         for pkt in pos_packets:
                             try:
                                 pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
@@ -994,11 +993,11 @@ class MainWindow(QMainWindow):
                                 bytes_sent += len(pkt.raw)
                             except Exception as e:
                                 pass
-                            time.sleep(0.001)  # Delay mínimo entre paquetes de posición
+                            time.sleep(0.001)  # Delay mínimo entre paquetes
 
                         # Pequeño delay entre fases para sincronización
                         if pos_packets and dmg_packets:
-                            time.sleep(0.01)  # 10ms para que posición se registre primero
+                            time.sleep(0.015)  # 15ms para que posición se registre primero
 
                         # FASE 2: Enviar TODO el DAÑO ACUMULADO de golpe (burst masivo)
                         for i in range(0, len(dmg_packets), GHOST_BURST_SIZE):
@@ -1013,7 +1012,7 @@ class MainWindow(QMainWindow):
                                     pass
                             # Micro delay entre bursts de daño
                             if i + GHOST_BURST_SIZE < len(dmg_packets):
-                                time.sleep(0.001)  # Delay más corto para daño
+                                time.sleep(0.001)  # Delay corto para daño
 
                     total_sent = sent_count + damage_count
                     self.session_packets_sent_ghost = total_sent
@@ -1026,14 +1025,14 @@ class MainWindow(QMainWindow):
 
                     # Mensaje informativo sobre teletransporte + daño
                     if damage_count > 0:
-                        self.signals.update_status.emit(f"👻 GHOST: Teletransporte + {damage_count} DAÑO ACUMULADO aplicado!", "success")
+                        self.signals.update_status.emit(f"👻 GHOST: Posición actualizada + {damage_count} DAÑO aplicado!", "success")
                     else:
-                        self.signals.update_status.emit(f"👻 GHOST: Teletransporte a nueva posición ({sent_count} paquetes)", "success")
+                        self.signals.update_status.emit(f"👻 GHOST: Posición actualizada ({sent_count} paquetes)", "success")
 
                 except Exception as e:
                     self.signals.update_status.emit(f"Erro ao enviar Ghost: {e}", "error")
-            if recent_position_packets or damage_pkts:
-                threading.Thread(target=lambda: send_ghost_position_and_damage(recent_position_packets, damage_pkts), daemon=True).start()
+            if current_position_packets or damage_pkts:
+                threading.Thread(target=lambda: send_ghost_position_and_damage(current_position_packets, damage_pkts), daemon=True).start()
             else:
                 self.session_packets_sent_ghost = 0
                 self.session_bytes_sent_ghost = 0
@@ -1230,8 +1229,12 @@ class MainWindow(QMainWindow):
                                 self.signals.update_packet_count.emit(total_ghost, "ghost")
                                 packet_handled = True
                             # Paquetes de POSICIÓN/MOVIMIENTO (tamaños más grandes)
+                            # BUFFER CIRCULAR: Solo mantener últimos MAX_GHOST_POSITION_BUFFER paquetes
                             elif (payload_len > 50 and payload_len < 200) or payload_len >= 60:
                                 packet_ghost.append(packet)
+                                # Mantener solo los últimos N paquetes (buffer circular)
+                                if len(packet_ghost) > MAX_GHOST_POSITION_BUFFER:
+                                    packet_ghost.pop(0)  # Eliminar el más antiguo
                                 self.network_stats.total_processed += 1
                                 total_ghost = len(packet_ghost) + len(ghost_damage_packets)
                                 self.signals.update_packet_count.emit(total_ghost, "ghost")
