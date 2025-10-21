@@ -965,41 +965,40 @@ class MainWindow(QMainWindow):
         if app_state == AppState.WAITING_FOR_HOTKEY:
             return
         if ghost_mode:
-            # DESACTIVAR: Enviar posición + todo el daño acumulado
+            # DESACTIVAR: Enviar SOLO posición actual (últimos paquetes) + todo el daño acumulado
             with lock:
                 ghost_mode = False
-                position_packets = list(packet_ghost)  # Paquetes de posición/movimiento
-                damage_pkts = list(ghost_damage_packets)  # Paquetes de daño acumulados
+                # SOLO tomar los ÚLTIMOS 20 paquetes de posición (posición actual/reciente)
+                # Esto evita enviar toda la ruta, solo la posición final
+                recent_position_packets = list(packet_ghost[-20:]) if len(packet_ghost) > 0 else []
+                damage_pkts = list(ghost_damage_packets)  # TODO el daño acumulado
                 packet_ghost.clear()
                 ghost_damage_packets.clear()
                 app_state = AppState.IDLE
             self.signals.update_button_state.emit(False, "Ghost")
             self.audio_manager.play_toggle_off()
             def send_ghost_position_and_damage(pos_packets, dmg_packets):
-                """Envía posición nueva + todo el daño acumulado instantáneamente"""
+                """Envía SOLO posición ACTUAL + todo el daño acumulado instantáneamente"""
                 try:
                     sent_count = 0
                     damage_count = 0
                     bytes_sent = 0
                     with pydivert.WinDivert(FILTER_GHOST, layer=pydivert.Layer.NETWORK) as sender:
-                        # FASE 1: Enviar paquetes de POSICIÓN primero (teletransporte a nueva posición)
-                        for i in range(0, len(pos_packets), GHOST_BURST_SIZE):
-                            burst = pos_packets[i:i+GHOST_BURST_SIZE]
-                            for pkt in burst:
-                                try:
-                                    pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
-                                    sender.send(pkt_rebuilt)
-                                    sent_count += 1
-                                    bytes_sent += len(pkt.raw)
-                                except Exception as e:
-                                    pass
-                            # Micro delay entre bursts de posición
-                            if i + GHOST_BURST_SIZE < len(pos_packets):
-                                time.sleep(0.002)
+                        # FASE 1: Enviar SOLO últimos paquetes de posición (POSICIÓN ACTUAL)
+                        # Sin burst, enviamos todos los paquetes recientes de golpe
+                        for pkt in pos_packets:
+                            try:
+                                pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
+                                sender.send(pkt_rebuilt)
+                                sent_count += 1
+                                bytes_sent += len(pkt.raw)
+                            except Exception as e:
+                                pass
+                            time.sleep(0.001)  # Delay mínimo entre paquetes de posición
 
                         # Pequeño delay entre fases para sincronización
                         if pos_packets and dmg_packets:
-                            time.sleep(0.005)
+                            time.sleep(0.01)  # 10ms para que posición se registre primero
 
                         # FASE 2: Enviar TODO el DAÑO ACUMULADO de golpe (burst masivo)
                         for i in range(0, len(dmg_packets), GHOST_BURST_SIZE):
@@ -1033,8 +1032,8 @@ class MainWindow(QMainWindow):
 
                 except Exception as e:
                     self.signals.update_status.emit(f"Erro ao enviar Ghost: {e}", "error")
-            if position_packets or damage_pkts:
-                threading.Thread(target=lambda: send_ghost_position_and_damage(position_packets, damage_pkts), daemon=True).start()
+            if recent_position_packets or damage_pkts:
+                threading.Thread(target=lambda: send_ghost_position_and_damage(recent_position_packets, damage_pkts), daemon=True).start()
             else:
                 self.session_packets_sent_ghost = 0
                 self.session_bytes_sent_ghost = 0
