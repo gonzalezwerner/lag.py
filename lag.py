@@ -394,6 +394,7 @@ packet_tele = []  # Pacotes de teleporte armazenados
 ghost_mode = False  # Modo fantasma ativo
 packet_ghost = []  # Pacotes de modo fantasma armazenados (posición + movimiento)
 ghost_damage_packets = []  # Pacotes de daño acumulados en modo ghost
+ghost_last_position_sent = None  # Último tiempo que se envió un paquete de posición en ghost
 freeze_mode = False  # Modo congelamento ativo
 packet_freeze = []  # Pacotes de congelamento armazenados
 damage_packets = []  # Pacotes de daño específicos
@@ -407,7 +408,7 @@ DAMAGE_BURST_SIZE = 50     # MEJORADO - Mantiene bursts pero controlados
 FREEZE_BURST_SIZE = 100    # MEJORADO - Mantiene bursts pero controlados
 # CONFIGURACIÓN MÁXIMA POTENCIA TELEPORT Y GHOST
 MAX_TELE_PACKETS = 800     # POTENTE - Máximo de paquetes teleport
-MAX_GHOST_POSITION_BUFFER = 5  # CRÍTICO - Solo mantener últimos 5 paquetes de posición
+GHOST_POSITION_SEND_INTERVAL = 0.5  # CRÍTICO - Enviar posición cada 0.5 segundos en Ghost mode
 TELE_BURST_SIZE = 75       # POTENTE - Burst masivo de teleport
 GHOST_BURST_SIZE = 60      # POTENTE - Burst masivo de ghost
 lock = threading.Lock()  # Lock para sincronização de threads
@@ -670,12 +671,13 @@ class MainWindow(QMainWindow):
 
     def init_globals(self):
         """Inicializa variáveis globais - PARA DAÑO 100% GARANTIZADO"""
-        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, freeze_mode, packet_freeze, damage_packets, freeze_start_time, last_packet_release, lock, running, app_state, hotkey_manager_tele, hotkey_manager_ghost, hotkey_manager_freeze
+        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, ghost_last_position_sent, freeze_mode, packet_freeze, damage_packets, freeze_start_time, last_packet_release, lock, running, app_state, hotkey_manager_tele, hotkey_manager_ghost, hotkey_manager_freeze
         tele_mode = False
         packet_tele = []
         ghost_mode = False
         packet_ghost = []
         ghost_damage_packets = []  # Paquetes de daño en modo ghost
+        ghost_last_position_sent = None  # Control de envío throttled de posición
         freeze_mode = False
         packet_freeze = []
         damage_packets = []
@@ -744,8 +746,8 @@ class MainWindow(QMainWindow):
         elif packet_type == "ghost":
             self.network_stats.packets_held_ghost = count
             with lock:
-                # 1 paquete de posición (último) + daño acumulado
-                self.network_stats.bytes_held_ghost = sum(len(pkt.raw) for pkt in packet_ghost) + sum(len(pkt.raw) for pkt in ghost_damage_packets)
+                # Solo daño acumulado (posición se envía periódicamente)
+                self.network_stats.bytes_held_ghost = sum(len(pkt.raw) for pkt in ghost_damage_packets)
         elif packet_type == "freeze":
             self.network_stats.packets_held_freeze = count
             with lock:
@@ -957,98 +959,82 @@ class MainWindow(QMainWindow):
             self.signals.update_network_stats.emit(self.network_stats)
 
     def toggle_ghost(self):
-        """Alterna o modo fantasma - MECÁNICA MEJORADA: Posición quieta + Acumulación de daño"""
-        global ghost_mode, app_state, packet_ghost, ghost_damage_packets
+        """Alterna o modo fantasma - THROTTLED POSITION: Posición periódica + Acumulación de daño"""
+        global ghost_mode, app_state, ghost_damage_packets, ghost_last_position_sent
         if not hotkey_manager_ghost.current_hotkey_config.is_valid:
             self.signals.update_status.emit("⚠️ Hotkey Ghost não configurada", "warning")
             return
         if app_state == AppState.WAITING_FOR_HOTKEY:
             return
         if ghost_mode:
-            # DESACTIVAR: Enviar 1 paquete de posición ACTUAL + TODO el daño
+            # DESACTIVAR: Enviar SOLO el daño acumulado (posición ya se actualizó periódicamente)
             with lock:
                 ghost_mode = False
-                current_pos = list(packet_ghost)  # Solo 1 paquete (el último)
-                damage_pkts = list(ghost_damage_packets)  # TODO el daño
-                packet_ghost.clear()
+                damage_pkts = list(ghost_damage_packets)  # TODO el daño acumulado
                 ghost_damage_packets.clear()
+                ghost_last_position_sent = None  # Reset timer
                 app_state = AppState.IDLE
             self.signals.update_button_state.emit(False, "Ghost")
             self.audio_manager.play_toggle_off()
-            def send_ghost_final(pos_pkt, dmg_packets):
-                """Envía 1 paquete de posición ACTUAL + TODO el daño acumulado"""
+            def send_ghost_damage_burst(dmg_packets):
+                """Envía TODO el daño acumulado en burst masivo"""
                 try:
-                    pos_count = 0
                     damage_count = 0
                     bytes_sent = 0
 
+                    if not dmg_packets:
+                        self.signals.update_status.emit(f"👻 GHOST desactivado - Sin daño", "info")
+                        return
+
                     with pydivert.WinDivert(FILTER_GHOST, layer=pydivert.Layer.NETWORK) as sender:
-                        # PASO 1: Enviar el ÚLTIMO paquete de posición (posición actual)
-                        if pos_pkt:
-                            for pkt in pos_pkt:
+                        # Enviar TODO el DAÑO ACUMULADO en bursts
+                        for i in range(0, len(dmg_packets), GHOST_BURST_SIZE):
+                            burst = dmg_packets[i:i+GHOST_BURST_SIZE]
+                            for pkt in burst:
                                 try:
                                     pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
                                     sender.send(pkt_rebuilt)
-                                    pos_count += 1
+                                    damage_count += 1
                                     bytes_sent += len(pkt.raw)
                                 except Exception as e:
                                     pass
-                            # Delay crítico para que posición se registre PRIMERO
-                            time.sleep(0.020)  # 20ms
+                            # Micro delay entre bursts
+                            if i + GHOST_BURST_SIZE < len(dmg_packets):
+                                time.sleep(0.001)
 
-                        # PASO 2: Enviar TODO el DAÑO ACUMULADO
-                        if dmg_packets:
-                            for i in range(0, len(dmg_packets), GHOST_BURST_SIZE):
-                                burst = dmg_packets[i:i+GHOST_BURST_SIZE]
-                                for pkt in burst:
-                                    try:
-                                        pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
-                                        sender.send(pkt_rebuilt)
-                                        damage_count += 1
-                                        bytes_sent += len(pkt.raw)
-                                    except Exception as e:
-                                        pass
-                                # Micro delay entre bursts de daño
-                                if i + GHOST_BURST_SIZE < len(dmg_packets):
-                                    time.sleep(0.001)
-
-                    total_sent = pos_count + damage_count
-                    self.session_packets_sent_ghost = total_sent
+                    self.session_packets_sent_ghost = damage_count
                     self.session_bytes_sent_ghost = bytes_sent
-                    self.network_stats.packets_sent_ghost = total_sent
+                    self.network_stats.packets_sent_ghost = damage_count
                     self.network_stats.bytes_sent_ghost = bytes_sent
-                    self.network_stats.total_processed += total_sent
+                    self.network_stats.total_processed += damage_count
                     self.signals.update_packet_count.emit(0, "ghost")
                     self.signals.update_network_stats.emit(self.network_stats)
 
                     # Mensaje de éxito
-                    if damage_count > 0:
-                        self.signals.update_status.emit(f"👻 GHOST: Posición actualizada + {damage_count} DAÑO!", "success")
-                    else:
-                        self.signals.update_status.emit(f"👻 GHOST: Posición actualizada", "success")
+                    self.signals.update_status.emit(f"👻 GHOST: {damage_count} paquetes de DAÑO aplicados!", "success")
 
                 except Exception as e:
                     self.signals.update_status.emit(f"Erro ao enviar Ghost: {e}", "error")
 
-            if current_pos or damage_pkts:
-                threading.Thread(target=lambda: send_ghost_final(current_pos, damage_pkts), daemon=True).start()
+            if damage_pkts:
+                threading.Thread(target=lambda: send_ghost_damage_burst(damage_pkts), daemon=True).start()
             else:
                 self.session_packets_sent_ghost = 0
                 self.session_bytes_sent_ghost = 0
                 self.signals.update_packet_count.emit(0, "ghost")
                 self.signals.update_status.emit(f"👻 GHOST desactivado", "info")
         else:
-            # ACTIVAR: Retener solo última posición + acumular daño
+            # ACTIVAR: Throttled position + acumular daño
             with lock:
                 ghost_mode = True
-                packet_ghost.clear()
                 ghost_damage_packets.clear()
+                ghost_last_position_sent = None  # Inicializar timer
                 app_state = AppState.CAPTURING_PACKETS
             self.session_packets_sent_ghost = 0
             self.session_bytes_sent_ghost = 0
             self.signals.update_button_state.emit(True, "Ghost")
             self.audio_manager.play_toggle_on()
-            self.signals.update_status.emit("👻 GHOST: Posición congelada - Acumulando DAÑO", "info")
+            self.signals.update_status.emit(f"👻 GHOST: Pos. cada {GHOST_POSITION_SEND_INTERVAL}s - Acumulando DAÑO", "info")
             self.signals.update_network_stats.emit(self.network_stats)
 
     def toggle_freeze(self):
@@ -1204,7 +1190,7 @@ class MainWindow(QMainWindow):
 
     def divert_packets(self):
         """Captura e manipula pacotes de rede"""
-        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, packet_freeze, freeze_mode, damage_packets, last_packet_release, running
+        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, ghost_last_position_sent, packet_freeze, freeze_mode, damage_packets, last_packet_release, running
         try:
             combined_filter = f"({FILTER_TELE}) or ({FILTER_GHOST}) or ({FILTER_FREEZE})"
             with pydivert.WinDivert(combined_filter) as w:
@@ -1218,26 +1204,33 @@ class MainWindow(QMainWindow):
                             self.network_stats.total_processed += 1
                             self.signals.update_packet_count.emit(len(packet_tele), "tele")
                             packet_handled = True
-                        # GHOST MODE DEFINITIVO: Mantener SOLO último paquete de posición + acumular daño
+                        # GHOST MODE THROTTLED: Enviar posición periódicamente + acumular TODO el daño
                         if not packet_handled and ghost_mode and packet.direction == pydivert.Direction.OUTBOUND and packet.udp:
                             payload_len = packet.udp.payload_len
                             # Paquetes de DAÑO (tamaños típicos de ataques/disparos)
+                            # SIEMPRE acumular, NUNCA enviar durante Ghost
                             if (payload_len >= 30 and payload_len <= 50) or payload_len == 40 or payload_len == 45:
                                 ghost_damage_packets.append(packet)
                                 self.network_stats.total_processed += 1
-                                total_ghost = len(packet_ghost) + len(ghost_damage_packets)
-                                self.signals.update_packet_count.emit(total_ghost, "ghost")
+                                self.signals.update_packet_count.emit(len(ghost_damage_packets), "ghost")
                                 packet_handled = True
-                            # Paquetes de POSICIÓN: Mantener SOLO el ÚLTIMO (reemplazar)
-                            # Esto mantiene sincronización sin enviar toda la ruta
+                            # Paquetes de POSICIÓN: Enviar PERIÓDICAMENTE (throttled)
+                            # Esto evita reset en distancias largas pero no muestra ruta completa
                             elif (payload_len > 50 and payload_len < 200) or payload_len >= 60:
-                                # SOBRESCRIBIR - solo mantener el más reciente
-                                packet_ghost.clear()  # Borrar anteriores
-                                packet_ghost.append(packet)  # Guardar SOLO este
+                                current_time = time.time()
+                                # Si es momento de enviar posición (ha pasado el intervalo)
+                                if ghost_last_position_sent is None or (current_time - ghost_last_position_sent) >= GHOST_POSITION_SEND_INTERVAL:
+                                    # ENVIAR este paquete de posición
+                                    try:
+                                        w.send(packet)
+                                        ghost_last_position_sent = current_time
+                                    except:
+                                        pass
+                                    packet_handled = True
+                                else:
+                                    # Aún no es momento, DESCARTAR este paquete
+                                    packet_handled = True
                                 self.network_stats.total_processed += 1
-                                total_ghost = len(packet_ghost) + len(ghost_damage_packets)
-                                self.signals.update_packet_count.emit(total_ghost, "ghost")
-                                packet_handled = True
                         if not packet_handled and freeze_mode and packet.direction == pydivert.Direction.INBOUND:
                             # LÓGICA DE AUTO-LIBERACIÓN PARA DAÑO 100% GARANTIZADO
                             # Verificar si necesitamos liberar paquetes automáticamente
