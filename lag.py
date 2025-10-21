@@ -392,7 +392,8 @@ class GreenCheckStyle(QProxyStyle):
 tele_mode = False  # Modo teleporte ativo
 packet_tele = []  # Pacotes de teleporte armazenados
 ghost_mode = False  # Modo fantasma ativo
-packet_ghost = []  # Pacotes de modo fantasma armazenados
+packet_ghost = []  # Pacotes de modo fantasma armazenados (posición + movimiento)
+ghost_damage_packets = []  # Pacotes de daño acumulados en modo ghost
 freeze_mode = False  # Modo congelamento ativo
 packet_freeze = []  # Pacotes de congelamento armazenados
 damage_packets = []  # Pacotes de daño específicos
@@ -617,9 +618,12 @@ class MainWindow(QMainWindow):
         self.bytes_sent_freeze_label = QLabel("B.Freeze Enviados: 0")
         self.bytes_sent_freeze_label.setFont(QFont("Consolas", 8))
         self.bytes_sent_freeze_label.setStyleSheet("color: #ffc0cb;")
-        self.damage_packets_label = QLabel("Daño Retenido: 0")
+        self.damage_packets_label = QLabel("Daño Freeze: 0")
         self.damage_packets_label.setFont(QFont("Consolas", 8))
         self.damage_packets_label.setStyleSheet("color: #ff4757;")
+        self.ghost_damage_label = QLabel("Daño Ghost: 0")
+        self.ghost_damage_label.setFont(QFont("Consolas", 8))
+        self.ghost_damage_label.setStyleSheet("color: #ffa502;")
         self.network_usage_label = QLabel("Rede: 0 KB/s")
         self.network_usage_label.setFont(QFont("Consolas", 8))
         self.network_usage_label.setStyleSheet("color: #d0bfff;")
@@ -651,7 +655,8 @@ class MainWindow(QMainWindow):
         row += 1
         stats_layout.addWidget(self.bytes_held_freeze_label, row, 0)
         stats_layout.addWidget(self.bytes_sent_freeze_label, row, 1)
-        stats_layout.addWidget(self.damage_packets_label, row, 2, 1, 2)
+        stats_layout.addWidget(self.damage_packets_label, row, 2)
+        stats_layout.addWidget(self.ghost_damage_label, row, 3)
         row += 1
         stats_layout.addWidget(self.network_usage_label, row, 0)
         stats_layout.addWidget(self.speed_up_label, row, 1)
@@ -665,11 +670,12 @@ class MainWindow(QMainWindow):
 
     def init_globals(self):
         """Inicializa variáveis globais - PARA DAÑO 100% GARANTIZADO"""
-        global tele_mode, packet_tele, ghost_mode, packet_ghost, freeze_mode, packet_freeze, damage_packets, freeze_start_time, last_packet_release, lock, running, app_state, hotkey_manager_tele, hotkey_manager_ghost, hotkey_manager_freeze
+        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, freeze_mode, packet_freeze, damage_packets, freeze_start_time, last_packet_release, lock, running, app_state, hotkey_manager_tele, hotkey_manager_ghost, hotkey_manager_freeze
         tele_mode = False
         packet_tele = []
         ghost_mode = False
         packet_ghost = []
+        ghost_damage_packets = []  # Paquetes de daño en modo ghost
         freeze_mode = False
         packet_freeze = []
         damage_packets = []
@@ -738,7 +744,8 @@ class MainWindow(QMainWindow):
         elif packet_type == "ghost":
             self.network_stats.packets_held_ghost = count
             with lock:
-                self.network_stats.bytes_held_ghost = sum(len(pkt.raw) for pkt in packet_ghost)
+                # Incluir tanto paquetes de movimiento como de daño en ghost
+                self.network_stats.bytes_held_ghost = sum(len(pkt.raw) for pkt in packet_ghost) + sum(len(pkt.raw) for pkt in ghost_damage_packets)
         elif packet_type == "freeze":
             self.network_stats.packets_held_freeze = count
             with lock:
@@ -865,7 +872,8 @@ class MainWindow(QMainWindow):
         self.bytes_sent_ghost_label.setText(f"B.Ghost Enviados: {self.format_bytes(self.session_bytes_sent_ghost)}")
         self.bytes_held_freeze_label.setText(f"B.Freeze Retidos: {self.format_bytes(stats.bytes_held_freeze)}")
         self.bytes_sent_freeze_label.setText(f"B.Freeze Enviados: {self.format_bytes(self.session_bytes_sent_freeze)}")
-        self.damage_packets_label.setText(f"Daño Retenido: {len(damage_packets) if 'damage_packets' in globals() else 0}")
+        self.damage_packets_label.setText(f"Daño Freeze: {len(damage_packets) if 'damage_packets' in globals() else 0}")
+        self.ghost_damage_label.setText(f"Daño Ghost: {len(ghost_damage_packets) if 'ghost_damage_packets' in globals() else 0}")
         self.network_usage_label.setText(f"Rede: {stats.network_usage:.2f} KB/s")
         self.speed_up_label.setText(f"Up: {stats.upload_speed:.2f} KB/s")
         self.speed_down_label.setText(f"Down: {stats.download_speed:.2f} KB/s")
@@ -949,30 +957,34 @@ class MainWindow(QMainWindow):
             self.signals.update_network_stats.emit(self.network_stats)
 
     def toggle_ghost(self):
-        """Alterna o modo fantasma"""
-        global ghost_mode, app_state, packet_ghost
-        if not hotkey_manager_ghost.current_hotkey_config.is_valid: 
+        """Alterna o modo fantasma - MECÁNICA MEJORADA: Posición quieta + Acumulación de daño"""
+        global ghost_mode, app_state, packet_ghost, ghost_damage_packets
+        if not hotkey_manager_ghost.current_hotkey_config.is_valid:
             self.signals.update_status.emit("⚠️ Hotkey Ghost não configurada", "warning")
             return
         if app_state == AppState.WAITING_FOR_HOTKEY:
             return
         if ghost_mode:
+            # DESACTIVAR: Enviar posición + todo el daño acumulado
             with lock:
                 ghost_mode = False
-                to_send = list(packet_ghost)
+                position_packets = list(packet_ghost)  # Paquetes de posición/movimiento
+                damage_pkts = list(ghost_damage_packets)  # Paquetes de daño acumulados
                 packet_ghost.clear()
+                ghost_damage_packets.clear()
                 app_state = AppState.IDLE
             self.signals.update_button_state.emit(False, "Ghost")
             self.audio_manager.play_toggle_off()
-            def send_all_ghost_packets(packets):
-                """Envia todos os pacotes do modo fantasma - CONFIGURACIÓN MÁXIMA POTENCIA"""
+            def send_ghost_position_and_damage(pos_packets, dmg_packets):
+                """Envía posición nueva + todo el daño acumulado instantáneamente"""
                 try:
                     sent_count = 0
+                    damage_count = 0
                     bytes_sent = 0
                     with pydivert.WinDivert(FILTER_GHOST, layer=pydivert.Layer.NETWORK) as sender:
-                        # BURST MASIVO DE GHOST - Envío en ráfagas devastadoras
-                        for i in range(0, len(packets), GHOST_BURST_SIZE):
-                            burst = packets[i:i+GHOST_BURST_SIZE]
+                        # FASE 1: Enviar paquetes de POSICIÓN primero (teletransporte a nueva posición)
+                        for i in range(0, len(pos_packets), GHOST_BURST_SIZE):
+                            burst = pos_packets[i:i+GHOST_BURST_SIZE]
                             for pkt in burst:
                                 try:
                                     pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
@@ -981,39 +993,64 @@ class MainWindow(QMainWindow):
                                     bytes_sent += len(pkt.raw)
                                 except Exception as e:
                                     pass
-                            # Micro delay entre bursts para máxima efectividad
-                            if i + GHOST_BURST_SIZE < len(packets):
-                                time.sleep(0.002)  # 2ms entre bursts de ghost
-                    self.session_packets_sent_ghost = sent_count
+                            # Micro delay entre bursts de posición
+                            if i + GHOST_BURST_SIZE < len(pos_packets):
+                                time.sleep(0.002)
+
+                        # Pequeño delay entre fases para sincronización
+                        if pos_packets and dmg_packets:
+                            time.sleep(0.005)
+
+                        # FASE 2: Enviar TODO el DAÑO ACUMULADO de golpe (burst masivo)
+                        for i in range(0, len(dmg_packets), GHOST_BURST_SIZE):
+                            burst = dmg_packets[i:i+GHOST_BURST_SIZE]
+                            for pkt in burst:
+                                try:
+                                    pkt_rebuilt = pydivert.Packet(pkt.raw, pkt.interface, pkt.direction)
+                                    sender.send(pkt_rebuilt)
+                                    damage_count += 1
+                                    bytes_sent += len(pkt.raw)
+                                except Exception as e:
+                                    pass
+                            # Micro delay entre bursts de daño
+                            if i + GHOST_BURST_SIZE < len(dmg_packets):
+                                time.sleep(0.001)  # Delay más corto para daño
+
+                    total_sent = sent_count + damage_count
+                    self.session_packets_sent_ghost = total_sent
                     self.session_bytes_sent_ghost = bytes_sent
-                    self.network_stats.packets_sent_ghost = sent_count
+                    self.network_stats.packets_sent_ghost = total_sent
                     self.network_stats.bytes_sent_ghost = bytes_sent
-                    self.network_stats.total_processed += sent_count
+                    self.network_stats.total_processed += total_sent
                     self.signals.update_packet_count.emit(0, "ghost")
                     self.signals.update_network_stats.emit(self.network_stats)
-                    
-                    # Mensaje de máxima potencia
-                    if sent_count > 0:
-                        self.signals.update_status.emit(f"👻 GHOST POTENTE liberado: {sent_count} paquetes DEVASTADORES", "success")
-                        
+
+                    # Mensaje informativo sobre teletransporte + daño
+                    if damage_count > 0:
+                        self.signals.update_status.emit(f"👻 GHOST: Teletransporte + {damage_count} DAÑO ACUMULADO aplicado!", "success")
+                    else:
+                        self.signals.update_status.emit(f"👻 GHOST: Teletransporte a nueva posición ({sent_count} paquetes)", "success")
+
                 except Exception as e:
                     self.signals.update_status.emit(f"Erro ao enviar Ghost: {e}", "error")
-            if to_send:
-                threading.Thread(target=lambda: send_all_ghost_packets(to_send), daemon=True).start()
+            if position_packets or damage_pkts:
+                threading.Thread(target=lambda: send_ghost_position_and_damage(position_packets, damage_pkts), daemon=True).start()
             else:
                 self.session_packets_sent_ghost = 0
                 self.session_bytes_sent_ghost = 0
                 self.signals.update_packet_count.emit(0, "ghost")
         else:
+            # ACTIVAR: Congelar posición visible + acumular movimiento y daño
             with lock:
                 ghost_mode = True
                 packet_ghost.clear()
+                ghost_damage_packets.clear()
                 app_state = AppState.CAPTURING_PACKETS
             self.session_packets_sent_ghost = 0
             self.session_bytes_sent_ghost = 0
             self.signals.update_button_state.emit(True, "Ghost")
             self.audio_manager.play_toggle_on()
-            self.signals.update_status.emit("👻 GHOST MÁXIMA POTENCIA ACTIVADO - Capturando TODO", "info")
+            self.signals.update_status.emit("👻 GHOST ACTIVO: Posición congelada - Acumulando movimiento y DAÑO", "info")
             self.signals.update_network_stats.emit(self.network_stats)
 
     def toggle_freeze(self):
@@ -1169,7 +1206,7 @@ class MainWindow(QMainWindow):
 
     def divert_packets(self):
         """Captura e manipula pacotes de rede"""
-        global tele_mode, packet_tele, ghost_mode, packet_freeze, freeze_mode, damage_packets, last_packet_release, running
+        global tele_mode, packet_tele, ghost_mode, packet_ghost, ghost_damage_packets, packet_freeze, freeze_mode, damage_packets, last_packet_release, running
         try:
             combined_filter = f"({FILTER_TELE}) or ({FILTER_GHOST}) or ({FILTER_FREEZE})"
             with pydivert.WinDivert(combined_filter) as w:
@@ -1183,13 +1220,23 @@ class MainWindow(QMainWindow):
                             self.network_stats.total_processed += 1
                             self.signals.update_packet_count.emit(len(packet_tele), "tele")
                             packet_handled = True
-                        if not packet_handled and ghost_mode and packet.direction == pydivert.Direction.OUTBOUND and packet.udp and \
-                           ((packet.udp.payload_len > 50 and packet.udp.payload_len < 200) or 
-                            packet.udp.payload_len == 40 or packet.udp.payload_len == 45 or packet.udp.payload_len == 30):
-                            packet_ghost.append(packet)
-                            self.network_stats.total_processed += 1
-                            self.signals.update_packet_count.emit(len(packet_ghost), "ghost")
-                            packet_handled = True
+                        # GHOST MODE MEJORADO: Separar paquetes de movimiento y daño
+                        if not packet_handled and ghost_mode and packet.direction == pydivert.Direction.OUTBOUND and packet.udp:
+                            payload_len = packet.udp.payload_len
+                            # Paquetes de DAÑO (tamaños típicos de ataques/disparos)
+                            if (payload_len >= 30 and payload_len <= 50) or payload_len == 40 or payload_len == 45:
+                                ghost_damage_packets.append(packet)
+                                self.network_stats.total_processed += 1
+                                total_ghost = len(packet_ghost) + len(ghost_damage_packets)
+                                self.signals.update_packet_count.emit(total_ghost, "ghost")
+                                packet_handled = True
+                            # Paquetes de POSICIÓN/MOVIMIENTO (tamaños más grandes)
+                            elif (payload_len > 50 and payload_len < 200) or payload_len >= 60:
+                                packet_ghost.append(packet)
+                                self.network_stats.total_processed += 1
+                                total_ghost = len(packet_ghost) + len(ghost_damage_packets)
+                                self.signals.update_packet_count.emit(total_ghost, "ghost")
+                                packet_handled = True
                         if not packet_handled and freeze_mode and packet.direction == pydivert.Direction.INBOUND:
                             # LÓGICA DE AUTO-LIBERACIÓN PARA DAÑO 100% GARANTIZADO
                             # Verificar si necesitamos liberar paquetes automáticamente
